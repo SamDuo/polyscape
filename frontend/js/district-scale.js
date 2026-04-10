@@ -1,148 +1,127 @@
 /**
  * PolyScape — District Scale Layer (12 <= zoom < 15)
- *
- * Renders SHAP radial-bar "lenses" at hex centroids using D3 arc
- * generators inside SVG markers on the Mapbox map.
+ * SHAP radial-bar lenses at hex centroids.
+ * Click lens → fly to street scale + open popup card.
  */
 
 class DistrictScaleLayer {
   constructor() {
     this.map = null;
-    this.markers = [];         // active mapboxgl.Marker instances
-    this._explanations = [];   // cached SHAP data
+    this.markers = [];
+    this._explanations = [];
     this.visible = false;
     this._tooltip = null;
+    this._loading = false;
+    this._lastBboxKey = '';
   }
 
-  /**
-   * Store map reference and create shared tooltip element.
-   */
   init(mapInstance) {
     this.map = mapInstance;
-
     this._tooltip = document.createElement('div');
     this._tooltip.className = 'shap-tooltip';
     this._tooltip.style.display = 'none';
     document.body.appendChild(this._tooltip);
   }
 
-  /**
-   * Batch-fetch SHAP explanations for visible hex centroids.
-   */
-  async loadExplanations(visibleHexes) {
+  async loadForBbox(bbox) {
+    const key = bbox.map(v => v.toFixed(3)).join(',');
+    if (key === this._lastBboxKey || this._loading) return;
+    this._lastBboxKey = key;
+    this._loading = true;
+
     try {
-      const resp = await fetch('/explain/batch', {
+      const pResp = await fetch(`/predict?bbox=${bbox.join(',')}&res=8`);
+      if (!pResp.ok) return;
+      const geojson = await pResp.json();
+
+      const allHexes = geojson.features.map(f => f.properties.h3_index);
+      const step = Math.max(1, Math.floor(allHexes.length / 80));
+      const sampled = allHexes.filter((_, i) => i % step === 0).slice(0, 80);
+      if (!sampled.length) return;
+
+      const eResp = await fetch('/explain/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hexes: visibleHexes }),
+        body: JSON.stringify({ h3_indices: sampled }),
       });
-      if (!resp.ok) return;
-      const data = await resp.json();
+      if (!eResp.ok) return;
+      const data = await eResp.json();
       this._explanations = data.explanations || [];
-
-      if (this.visible) {
-        this.renderLenses(this._explanations);
-      }
-    } catch (err) {
-      console.warn('DistrictScaleLayer: loadExplanations failed', err);
-    }
+      if (this.visible) this.renderLenses(this._explanations);
+    } catch (err) { console.warn('DistrictScale: loadForBbox failed', err); }
+    finally { this._loading = false; }
   }
 
-  /**
-   * Create or update SHAP lens markers for each explanation.
-   */
   renderLenses(explanations) {
-    // Clear existing markers
-    this.markers.forEach((m) => m.remove());
+    this.markers.forEach(m => m.remove());
     this.markers = [];
 
     for (const entry of explanations) {
-      const { h3_index, shap_values, centroid } = entry;
+      const { h3_index, shap_values, centroid, score } = entry;
       if (!shap_values || !centroid) continue;
 
       const lngLat = [centroid.lng, centroid.lat];
-
-      // Build SVG element
-      const el = this.createLensSVG(shap_values);
+      const el = this._createLensSVG(shap_values, score);
       el.classList.add('shap-lens');
 
-      // Hover → tooltip
-      el.addEventListener('mouseenter', (e) => this._showTooltip(e, shap_values));
-      el.addEventListener('mousemove', (e) => this._moveTooltip(e));
-      el.addEventListener('mouseleave', () => this._hideTooltip());
+      el.addEventListener('mouseenter', e => this._showTip(e, shap_values, score));
+      el.addEventListener('mousemove', e => { this._tooltip.style.left = e.pageX + 12 + 'px'; this._tooltip.style.top = e.pageY - 8 + 'px'; });
+      el.addEventListener('mouseleave', () => { this._tooltip.style.display = 'none'; });
 
-      // Click → fly to street scale
       el.addEventListener('click', () => {
         this.map.flyTo({ center: lngLat, zoom: 16, duration: 1200 });
+        this.map.once('moveend', () => { if (streetLayer) streetLayer.openCardForHex(h3_index, lngLat); });
       });
 
       const marker = new mapboxgl.Marker({ element: el, anchor: 'center' })
-        .setLngLat(lngLat)
-        .addTo(this.map);
-
+        .setLngLat(lngLat).addTo(this.map);
       marker._h3Index = h3_index;
+
+      // If band is not active, hide immediately (safety net)
+      if (!this.visible) el.style.display = 'none';
+
       this.markers.push(marker);
     }
   }
 
-  /**
-   * Generate a radial-bar SVG element from SHAP values.
-   * Each of the top-5 features gets an arc segment.
-   * Positive SHAP → green (#66bb6a), Negative → red (#ef5350).
-   * All bars extend outward; color encodes direction.
-   *
-   * @param {Array<{feature: string, value: number}>} shapValues
-   * @returns {HTMLElement} SVG element (60x60 px)
-   */
-  createLensSVG(shapValues) {
+  _createLensSVG(shapValues, score) {
     const ns = 'http://www.w3.org/2000/svg';
-    const size = 60;
-    const innerR = 8;
-    const maxOuterR = 28;
-    const gap = 0.04; // radians between bars
+    const size = 60, innerR = 8, maxR = 28, gap = 0.04;
     const top5 = shapValues.slice(0, 5);
 
     const svg = document.createElementNS(ns, 'svg');
     svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
-    svg.setAttribute('width', size);
-    svg.setAttribute('height', size);
+    svg.setAttribute('width', size); svg.setAttribute('height', size);
 
     const g = document.createElementNS(ns, 'g');
     g.setAttribute('transform', `translate(${size / 2},${size / 2})`);
     svg.appendChild(g);
 
-    // Background circle
     const bg = document.createElementNS(ns, 'circle');
     bg.setAttribute('r', innerR);
-    bg.setAttribute('fill', 'rgba(17,23,34,0.7)');
-    bg.setAttribute('stroke', 'rgba(0,191,165,0.3)');
-    bg.setAttribute('stroke-width', '0.5');
+    bg.setAttribute('fill', score > 0.5 ? 'rgba(102,187,106,0.25)' : 'rgba(0,191,165,0.18)');
+    bg.setAttribute('stroke', 'rgba(0,191,165,0.35)'); bg.setAttribute('stroke-width', '0.5');
     g.appendChild(bg);
 
-    if (top5.length === 0) return svg;
+    if (score != null) {
+      const t = document.createElementNS(ns, 'text');
+      t.setAttribute('text-anchor', 'middle'); t.setAttribute('dy', '.35em');
+      t.setAttribute('fill', '#e0e6ed'); t.setAttribute('font-size', '6'); t.setAttribute('font-weight', '600');
+      t.textContent = score.toFixed(2);
+      g.appendChild(t);
+    }
 
-    const maxAbsVal = Math.max(...top5.map((s) => Math.abs(s.value)), 0.01);
-    const sliceAngle = (2 * Math.PI) / top5.length;
-
-    const arcGen = d3.arc();
+    if (!top5.length) return svg;
+    const maxAbs = Math.max(...top5.map(s => Math.abs(s.value)), 0.001);
+    const slice = (2 * Math.PI) / top5.length;
+    const arc = d3.arc();
 
     top5.forEach((item, i) => {
-      const startAngle = i * sliceAngle + gap / 2;
-      const endAngle = (i + 1) * sliceAngle - gap / 2;
-      const ratio = Math.abs(item.value) / maxAbsVal;
-      const outerR = innerR + ratio * (maxOuterR - innerR);
-      const color = item.value >= 0 ? '#66bb6a' : '#ef5350';
-
-      const pathD = arcGen({
-        innerRadius: innerR,
-        outerRadius: outerR,
-        startAngle,
-        endAngle,
-      });
-
+      const sA = i * slice + gap / 2, eA = (i + 1) * slice - gap / 2;
+      const oR = innerR + (Math.abs(item.value) / maxAbs) * (maxR - innerR);
       const path = document.createElementNS(ns, 'path');
-      path.setAttribute('d', pathD);
-      path.setAttribute('fill', color);
+      path.setAttribute('d', arc({ innerRadius: innerR, outerRadius: oR, startAngle: sA, endAngle: eA }));
+      path.setAttribute('fill', item.value >= 0 ? '#66bb6a' : '#ef5350');
       path.setAttribute('opacity', '0.8');
       g.appendChild(path);
     });
@@ -150,96 +129,39 @@ class DistrictScaleLayer {
     return svg;
   }
 
-  /**
-   * Show tooltip with feature names and SHAP values.
-   */
-  _showTooltip(event, shapValues) {
-    const top5 = shapValues.slice(0, 5);
-    const rows = top5.map((s) => {
+  _showTip(event, shapValues, score) {
+    let html = score != null ? `<div style="margin-bottom:4px;font-weight:600;color:#00bfa5">Score: ${score.toFixed(3)}</div>` : '';
+    html += shapValues.slice(0, 5).map(s => {
       const cls = s.value >= 0 ? 'positive' : 'negative';
-      const sign = s.value >= 0 ? '+' : '';
-      return `<span class="feature-name">${s.feature}:</span> <span class="feature-value ${cls}">${sign}${s.value.toFixed(3)}</span>`;
-    });
-    this._tooltip.innerHTML = rows.join('<br>');
+      return `<span class="feature-name">${s.feature}:</span> <span class="feature-value ${cls}">${(s.value >= 0 ? '+' : '') + s.value.toFixed(4)}</span>`;
+    }).join('<br>');
+    this._tooltip.innerHTML = html;
     this._tooltip.style.display = 'block';
-    this._moveTooltip(event);
-  }
-
-  _moveTooltip(event) {
     this._tooltip.style.left = event.pageX + 12 + 'px';
     this._tooltip.style.top = event.pageY - 8 + 'px';
   }
 
-  _hideTooltip() {
-    this._tooltip.style.display = 'none';
-  }
-
   /**
-   * Show district-scale markers.
+   * Show ALL lens markers. Called when entering district band.
    */
   show() {
     this.visible = true;
-    this.markers.forEach((m) => {
+    this.markers.forEach(m => {
+      m.getElement().style.display = '';
       m.getElement().style.opacity = '1';
       m.getElement().style.pointerEvents = 'auto';
     });
-    this.updateVisibility();
   }
 
   /**
-   * Hide district-scale markers.
+   * Hide ALL lens markers. Called when leaving district band.
+   * Uses display:none so they don't intercept events or render at all.
    */
   hide() {
     this.visible = false;
-    this.markers.forEach((m) => {
-      m.getElement().style.opacity = '0';
-      m.getElement().style.pointerEvents = 'none';
+    this.markers.forEach(m => {
+      m.getElement().style.display = 'none';
     });
-  }
-
-  /**
-   * Only show markers within current viewport (performance cull).
-   */
-  updateVisibility() {
-    if (!this.visible) return;
-
-    const bounds = this.map.getBounds();
-    const visibleHexes = [];
-
-    for (const marker of this.markers) {
-      const lngLat = marker.getLngLat();
-      const inView = bounds.contains(lngLat);
-      marker.getElement().style.display = inView ? '' : 'none';
-      if (inView && marker._h3Index) {
-        visibleHexes.push(marker._h3Index);
-      }
-    }
-
-    // If we have no explanations yet but have hex data from city layer,
-    // attempt to load them
-    if (this._explanations.length === 0 && visibleHexes.length === 0) {
-      const bbox = [
-        bounds.getWest(), bounds.getSouth(),
-        bounds.getEast(), bounds.getNorth(),
-      ];
-      this._fetchForBbox(bbox);
-    }
-  }
-
-  /**
-   * Attempt to fetch explanations for hexes in a bounding box.
-   */
-  async _fetchForBbox(bbox) {
-    try {
-      const resp = await fetch(`/explain?bbox=${bbox.join(',')}`);
-      if (!resp.ok) return;
-      const data = await resp.json();
-      this._explanations = data.explanations || [];
-      if (this.visible) {
-        this.renderLenses(this._explanations);
-      }
-    } catch {
-      // silent — backend may not be running
-    }
+    this._tooltip.style.display = 'none';
   }
 }

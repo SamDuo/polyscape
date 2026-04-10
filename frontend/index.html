@@ -9,55 +9,105 @@
   <link rel="stylesheet" href="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.css">
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.js"></script>
 
-  <!-- Deck.gl v9.1.0 (core + aggregation layers + mapbox integration) -->
-  <script src="https://unpkg.com/@deck.gl/core@9.1.0/dist.min.js"></script>
-  <script src="https://unpkg.com/@deck.gl/layers@9.1.0/dist.min.js"></script>
-  <script src="https://unpkg.com/@deck.gl/aggregation-layers@9.1.0/dist.min.js"></script>
-  <script src="https://unpkg.com/@deck.gl/geo-layers@9.1.0/dist.min.js"></script>
-  <script src="https://unpkg.com/@deck.gl/mapbox@9.1.0/dist.min.js"></script>
+  <!-- H3-js MUST load BEFORE deck.gl (peer dependency for H3HexagonLayer) -->
+  <script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
 
-  <!-- D3.js v7.9.0 + d3-contour v4.0.2 -->
+  <!-- Deck.gl v9.0 standalone bundle (includes geo-layers, mapbox overlay) -->
+  <script src="https://unpkg.com/deck.gl@9.0.0/dist.min.js"></script>
+
+  <!-- D3.js v7 (includes d3-contour) -->
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/d3-contour@4.0.2/dist/d3-contour.min.js"></script>
 
-  <!-- H3-js v4.2.0 (client-side hex operations) -->
-  <script src="https://unpkg.com/h3-js@4.2.0/dist/h3-js.umd.js"></script>
-
-  <!-- PolyScape styles -->
   <link rel="stylesheet" href="css/polyscape.css">
 </head>
 <body>
 
-  <!-- Full-viewport map container -->
+  <!-- Full-viewport map -->
   <div id="map"></div>
 
-  <!-- Left sidebar: scenario controls -->
-  <div id="scenario-panel" class="scenario-panel"></div>
-
-  <!-- Bottom stats bar -->
-  <div id="stats-bar" class="stats-bar">
-    <div class="stat-item">
-      <span class="stat-label">Band:</span>
-      <span class="stat-value" id="stat-band">--</span>
+  <!-- Toolbar (top) -->
+  <div id="toolbar" class="toolbar">
+    <div class="toolbar-left">
+      <span class="logo"><span class="logo-accent">Poly</span>Scape</span>
     </div>
-    <div class="stat-item">
-      <span class="stat-label">Zoom:</span>
-      <span class="stat-value" id="stat-zoom">--</span>
+    <div class="toolbar-center">
+      <div class="search-box">
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="search-input" placeholder="Search Atlanta hex...">
+      </div>
     </div>
-    <div class="stat-item">
-      <span class="stat-label">Hexes:</span>
-      <span class="stat-value" id="stat-hexes">0</span>
-    </div>
-    <div class="stat-item">
-      <span class="stat-label">Visible:</span>
-      <span class="stat-value" id="stat-visible">0</span>
+    <div class="toolbar-right">
+      <button class="toolbar-btn" id="btn-filters" title="Filters & Scenarios">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        <span>Filters</span>
+      </button>
+      <button class="toolbar-btn" id="btn-layers" title="Map Layers">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        <span>Layers</span>
+      </button>
+      <button class="toolbar-btn" id="btn-3d" title="Toggle 3D">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3L2 8l10 5 10-5-10-5z"/><path d="M2 16l10 5 10-5"/></svg>
+        <span>3D</span>
+      </button>
     </div>
   </div>
 
-  <!-- Scale indicator badge (top-right) -->
-  <div id="scale-indicator" class="scale-indicator">City</div>
+  <!-- Filters dropdown -->
+  <div id="filters-dropdown" class="dropdown-panel" style="display:none">
+    <h3>Scenario B — What-If</h3>
+    <label>Competitor Count <span class="slider-val" id="val-competitor">0</span></label>
+    <input type="range" id="slider-competitor" min="0" max="20" step="1" value="0">
+    <label>Median Income <span class="slider-val" id="val-income">$50,000</span></label>
+    <input type="range" id="slider-income" min="20000" max="150000" step="5000" value="50000">
+    <label>Walk Score <span class="slider-val" id="val-walk">0</span></label>
+    <input type="range" id="slider-walk" min="0" max="200" step="5" value="0">
+    <label>Complementary POIs <span class="slider-val" id="val-comp">0</span></label>
+    <input type="range" id="slider-comp" min="0" max="50" step="1" value="0">
+    <div class="dropdown-actions">
+      <button class="btn-primary" id="apply-scenario">Apply</button>
+      <button class="btn-ghost" id="reset-scenario">Reset</button>
+    </div>
+  </div>
 
-  <!-- PolyScape JS modules (order matters: dependencies first) -->
+  <!-- Layers dropdown -->
+  <div id="layers-dropdown" class="dropdown-panel dropdown-right" style="display:none">
+    <h3>Map Layers</h3>
+    <label class="toggle-row"><input type="checkbox" id="layer-hexes" checked> Hex Grid</label>
+    <label class="toggle-row"><input type="checkbox" id="layer-contours" checked> Contour Lines</label>
+    <label class="toggle-row"><input type="checkbox" id="layer-lenses"> SHAP Lenses</label>
+    <label class="toggle-row"><input type="checkbox" id="layer-satellite"> Satellite</label>
+  </div>
+
+  <!-- Brief bar (fixed bottom, 4 columns) -->
+  <div id="brief-bar" class="brief-bar">
+    <div class="brief-col brief-scale">
+      <div class="brief-label">Scale</div>
+      <div class="brief-value" id="brief-band">City</div>
+    </div>
+    <div class="brief-col brief-stats">
+      <div class="brief-label">Top Site</div>
+      <div class="brief-value" id="brief-top">--</div>
+    </div>
+    <div class="brief-col brief-scenario">
+      <div class="brief-label">Scenario</div>
+      <div class="brief-value" id="brief-scenario">Base</div>
+    </div>
+    <div class="brief-col brief-cta">
+      <div class="brief-label" id="brief-pinned-count">0 pinned</div>
+      <button class="btn-compare" id="btn-compare" style="display:none">Compare</button>
+    </div>
+  </div>
+
+  <!-- Compare panel (slides up above brief bar) -->
+  <div id="compare-panel" class="compare-panel" style="display:none">
+    <div class="compare-header">
+      <h3>Compare Sites</h3>
+      <button class="close-btn" id="close-compare">&times;</button>
+    </div>
+    <div class="compare-body" id="compare-body"></div>
+  </div>
+
+  <!-- JS modules -->
   <script src="js/city-scale.js"></script>
   <script src="js/district-scale.js"></script>
   <script src="js/street-scale.js"></script>

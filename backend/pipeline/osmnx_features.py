@@ -1,42 +1,27 @@
 """OSMnx-based network features for H3 hexes.
 
-Computes walk score (amenity count within 800m network distance),
-transit proximity (distance to nearest MARTA stop), and road density
-(km of road per hex area) for each H3 hex cell.
+Computes walk score (amenity count within 800m buffer), transit proximity
+(distance to nearest MARTA stop), and road density (km of road per hex area)
+for each H3 hex cell.
+
+Uses BULK downloads (one API call per feature type for the entire bbox)
+followed by in-memory spatial joins — orders of magnitude faster than
+per-hex queries.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import geopandas as gpd
 import numpy as np
 import osmnx as ox
 import pandas as pd
+from scipy.spatial import cKDTree
 from shapely.geometry import Point
 
-# Network distance threshold for walk score (meters)
-WALK_DISTANCE_M: int = 800
-
-# Amenity tags to count for walk score
-WALK_AMENITY_TAGS: dict[str, list[str]] = {
-    "amenity": [
-        "restaurant",
-        "cafe",
-        "pharmacy",
-        "bank",
-        "school",
-        "library",
-        "hospital",
-        "clinic",
-        "supermarket",
-        "marketplace",
-        "post_office",
-        "community_centre",
-    ],
-    "shop": ["supermarket", "convenience", "bakery", "grocery"],
-}
+# Buffer radius for walk score (meters, in projected CRS)
+WALK_BUFFER_M: int = 800
 
 # MARTA transit stop tags
 TRANSIT_TAGS: dict[str, str | list[str]] = {
@@ -46,168 +31,205 @@ TRANSIT_TAGS: dict[str, str | list[str]] = {
 }
 
 
-def compute_walk_score(
+def _tile_bbox(
     hex_gdf: gpd.GeoDataFrame,
-    distance_m: int = WALK_DISTANCE_M,
-) -> pd.DataFrame:
-    """Count amenities within network walking distance of each hex centroid.
-
-    Parameters
-    ----------
-    hex_gdf : gpd.GeoDataFrame
-        H3 hex grid with h3_index, lat, lng columns.
-    distance_m : int
-        Network distance threshold in meters.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: h3_index, walk_score (amenity count).
-    """
-    records: list[dict] = []
-
-    for _, row in hex_gdf.iterrows():
-        h3_idx = row["h3_index"]
-        lat, lng = row["lat"], row["lng"]
-        try:
-            amenities = ox.features_from_point(
-                (lat, lng),
-                tags={"amenity": True, "shop": True},
-                dist=distance_m,
-            )
-            score = len(amenities)
-        except Exception:
-            score = 0
-
-        records.append({"h3_index": h3_idx, "walk_score": score})
-
-    result = pd.DataFrame(records)
-    print(f"Computed walk scores for {len(result)} hexes")
-    return result
-
-
-def compute_transit_proximity(
-    hex_gdf: gpd.GeoDataFrame,
-    search_radius_m: int = 2000,
-) -> pd.DataFrame:
-    """Compute distance from each hex centroid to nearest transit stop.
-
-    Parameters
-    ----------
-    hex_gdf : gpd.GeoDataFrame
-        H3 hex grid with h3_index, lat, lng columns.
-    search_radius_m : int
-        Search radius in meters for finding transit stops.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: h3_index, transit_proximity (meters to nearest stop).
-    """
-    # Download all MARTA stops within the hex grid extent
+    step_deg: float = 0.15,
+) -> list[tuple[float, float, float, float]]:
+    """Split hex grid extent into manageable Overpass tiles (N, S, E, W)."""
     bounds = hex_gdf.total_bounds  # [minx, miny, maxx, maxy]
-    center_lat = (bounds[1] + bounds[3]) / 2
-    center_lng = (bounds[0] + bounds[2]) / 2
+    west, south, east, north = bounds[0], bounds[1], bounds[2], bounds[3]
+    tiles = []
+    lat = south
+    while lat < north:
+        lng = west
+        while lng < east:
+            t_north = min(lat + step_deg, north)
+            t_east = min(lng + step_deg, east)
+            tiles.append((t_north, lat, t_east, lng))  # N, S, E, W
+            lng += step_deg
+        lat += step_deg
+    return tiles
 
-    try:
-        # Fetch transit stops for the whole metro area
-        transit_stops = ox.features_from_bbox(
-            bbox=(bounds[3], bounds[1], bounds[2], bounds[0]),  # north, south, east, west
-            tags=TRANSIT_TAGS,
-        )
-        # Get point geometries (centroids for non-point features)
-        stop_points = transit_stops.geometry.centroid
-        stop_gdf = gpd.GeoDataFrame(
-            geometry=stop_points, crs="EPSG:4326"
-        ).to_crs("EPSG:32616")
-    except Exception as exc:
-        print(f"Warning: could not fetch transit stops: {exc}")
-        # Return NaN for all hexes
-        return pd.DataFrame(
-            {
-                "h3_index": hex_gdf["h3_index"],
-                "transit_proximity": np.nan,
-            }
-        )
 
-    # Project hex centroids to UTM
+def _fetch_features_tiled(
+    hex_gdf: gpd.GeoDataFrame,
+    tags: dict,
+    label: str,
+    step_deg: float = 0.15,
+) -> gpd.GeoDataFrame:
+    """Download OSM features across tiled bboxes, dedup, return one GDF."""
+    tiles = _tile_bbox(hex_gdf, step_deg)
+    print(f"Downloading {label} across {len(tiles)} tiles...")
+
+    frames = []
+    for i, bbox in enumerate(tiles):
+        try:
+            gdf = ox.features_from_bbox(bbox=bbox, tags=tags)
+            if len(gdf) > 0:
+                frames.append(gdf)
+        except Exception:
+            pass
+        if (i + 1) % 20 == 0:
+            print(f"  ... {i + 1}/{len(tiles)} tiles done")
+
+    if not frames:
+        print(f"  Warning: no {label} found in any tile")
+        return gpd.GeoDataFrame(columns=["geometry"], crs="EPSG:4326")
+
+    merged = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True))
+    # Dedup on geometry centroid (tiles overlap at edges)
+    merged["_cx"] = merged.geometry.centroid.x.round(6)
+    merged["_cy"] = merged.geometry.centroid.y.round(6)
+    merged = merged.drop_duplicates(subset=["_cx", "_cy"]).drop(columns=["_cx", "_cy"])
+    merged = merged.set_crs("EPSG:4326", allow_override=True)
+    print(f"  Total {label}: {len(merged)} features (deduped)")
+    return merged
+
+
+def compute_walk_score(hex_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Count amenities within 800m Euclidean buffer of each hex centroid.
+
+    Downloads amenities/shops via tiled Overpass queries, then uses
+    a spatial join to count per hex.
+    """
+    amenities = _fetch_features_tiled(
+        hex_gdf, tags={"amenity": True, "shop": True}, label="amenities"
+    )
+
+    if amenities.empty:
+        return pd.DataFrame({"h3_index": hex_gdf["h3_index"], "walk_score": 0})
+
+    amenity_points = amenities.copy()
+    amenity_points["geometry"] = amenity_points.geometry.centroid
+    amenity_gdf = gpd.GeoDataFrame(
+        amenity_points[["geometry"]], crs="EPSG:4326"
+    ).to_crs("EPSG:32616")
+
     hex_points = gpd.GeoDataFrame(
-        {"h3_index": hex_gdf["h3_index"]},
+        {"h3_index": hex_gdf["h3_index"].values},
         geometry=[Point(lng, lat) for lng, lat in zip(hex_gdf["lng"], hex_gdf["lat"])],
         crs="EPSG:4326",
     ).to_crs("EPSG:32616")
 
-    records: list[dict] = []
-    for _, row in hex_points.iterrows():
-        distances = stop_gdf.geometry.distance(row.geometry)
-        min_dist = distances.min() if len(distances) > 0 else np.nan
-        records.append(
-            {"h3_index": row["h3_index"], "transit_proximity": min_dist}
-        )
+    hex_points["buffer"] = hex_points.geometry.buffer(WALK_BUFFER_M)
+    hex_buffers = hex_points.set_geometry("buffer")
 
-    result = pd.DataFrame(records)
-    print(f"Computed transit proximity for {len(result)} hexes")
+    joined = gpd.sjoin(
+        amenity_gdf,
+        hex_buffers[["h3_index", "buffer"]].set_geometry("buffer"),
+        predicate="within",
+    )
+    counts = joined.groupby("h3_index").size().rename("walk_score").reset_index()
+
+    result = hex_gdf[["h3_index"]].merge(counts, on="h3_index", how="left")
+    result["walk_score"] = result["walk_score"].fillna(0).astype(int)
+
+    print(f"Walk score: {len(result)} hexes (mean={result['walk_score'].mean():.1f})")
+    return result[["h3_index", "walk_score"]]
+
+
+def compute_transit_proximity(hex_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Compute distance from each hex centroid to nearest transit stop.
+
+    Downloads transit stops via tiled queries, then uses a KD-tree.
+    """
+    transit_stops = _fetch_features_tiled(
+        hex_gdf, tags=TRANSIT_TAGS, label="transit stops", step_deg=0.25,
+    )
+
+    if transit_stops.empty:
+        return pd.DataFrame({"h3_index": hex_gdf["h3_index"], "transit_proximity": np.nan})
+
+    stop_gdf = gpd.GeoDataFrame(
+        geometry=transit_stops.geometry.centroid.values, crs="EPSG:4326"
+    ).to_crs("EPSG:32616")
+
+    hex_points = gpd.GeoDataFrame(
+        {"h3_index": hex_gdf["h3_index"].values},
+        geometry=[Point(lng, lat) for lng, lat in zip(hex_gdf["lng"], hex_gdf["lat"])],
+        crs="EPSG:4326",
+    ).to_crs("EPSG:32616")
+
+    stop_coords = np.array([(g.x, g.y) for g in stop_gdf.geometry])
+    hex_coords = np.array([(g.x, g.y) for g in hex_points.geometry])
+    tree = cKDTree(stop_coords)
+    distances, _ = tree.query(hex_coords, k=1)
+
+    result = pd.DataFrame({
+        "h3_index": hex_gdf["h3_index"].values,
+        "transit_proximity": distances,
+    })
+
+    print(f"Transit proximity: {len(result)} hexes (median={np.nanmedian(distances):.0f}m)")
     return result
 
 
 def compute_road_density(hex_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     """Compute road density (km of road per km^2) for each hex.
 
-    Parameters
-    ----------
-    hex_gdf : gpd.GeoDataFrame
-        H3 hex grid with h3_index, lat, lng, geometry columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: h3_index, road_density (km road / km^2 hex area).
+    Downloads the road network via tiled graph queries, converts to
+    edges GeoDataFrame, then does spatial join to sum lengths per hex.
     """
-    # Project hex grid to UTM for area/length calculations
-    hex_proj = hex_gdf.to_crs("EPSG:32616")
+    tiles = _tile_bbox(hex_gdf, step_deg=0.15)
+    print(f"Downloading road network across {len(tiles)} tiles...")
 
-    records: list[dict] = []
-    for _, row in hex_gdf.iterrows():
-        h3_idx = row["h3_index"]
-        lat, lng = row["lat"], row["lng"]
+    edge_frames = []
+    for i, bbox in enumerate(tiles):
         try:
-            graph = ox.graph_from_point(
-                (lat, lng),
-                dist=500,
-                network_type="drive",
-            )
+            graph = ox.graph_from_bbox(bbox=bbox, network_type="drive")
             edges = ox.graph_to_gdfs(graph, nodes=False)
-            total_length_m = edges["length"].sum() if "length" in edges.columns else 0.0
-            total_length_km = total_length_m / 1000.0
+            edge_frames.append(edges[["geometry", "length"]])
         except Exception:
-            total_length_km = 0.0
+            pass
+        if (i + 1) % 20 == 0:
+            print(f"  ... {i + 1}/{len(tiles)} tiles done")
 
-        # Hex area in km^2
-        hex_row_proj = hex_proj[hex_proj["h3_index"] == h3_idx]
-        if len(hex_row_proj) > 0:
-            hex_area_km2 = hex_row_proj.geometry.area.values[0] / 1e6
-        else:
-            hex_area_km2 = 1.0  # fallback to avoid division by zero
+    if not edge_frames:
+        print("  Warning: no road segments downloaded")
+        return pd.DataFrame({"h3_index": hex_gdf["h3_index"], "road_density": 0.0})
 
-        density = total_length_km / hex_area_km2 if hex_area_km2 > 0 else 0.0
-        records.append({"h3_index": h3_idx, "road_density": density})
+    all_edges = gpd.GeoDataFrame(pd.concat(edge_frames, ignore_index=True), crs="EPSG:4326")
+    all_edges = all_edges.to_crs("EPSG:32616")
+    print(f"  Total road segments: {len(all_edges)}")
 
-    result = pd.DataFrame(records)
-    print(f"Computed road density for {len(result)} hexes")
+    hex_proj = hex_gdf[["h3_index", "geometry"]].to_crs("EPSG:32616")
+    hex_proj["hex_area_km2"] = hex_proj.geometry.area / 1e6
+
+    joined = gpd.sjoin(
+        all_edges[["geometry", "length"]],
+        hex_proj[["h3_index", "geometry"]],
+        predicate="intersects",
+    )
+
+    road_km = (
+        joined.groupby("h3_index")["length"]
+        .sum()
+        .div(1000.0)
+        .rename("road_length_km")
+        .reset_index()
+    )
+
+    result = hex_proj[["h3_index", "hex_area_km2"]].merge(road_km, on="h3_index", how="left")
+    result["road_length_km"] = result["road_length_km"].fillna(0.0)
+    result["road_density"] = result["road_length_km"] / result["hex_area_km2"]
+    result = result[["h3_index", "road_density"]]
+
+    print(f"Road density: {len(result)} hexes (mean={result['road_density'].mean():.1f} km/km²)")
     return result
 
 
 if __name__ == "__main__":
     from backend.pipeline.hex_grid import generate_hex_grid
 
-    grid = generate_hex_grid(resolution=7)  # Use res 7 for faster testing
-    sample = grid.head(10)  # Small sample for testing
+    grid = generate_hex_grid(resolution=8)
 
-    walk = compute_walk_score(sample)
-    print(f"Walk scores:\n{walk}")
+    walk = compute_walk_score(grid)
+    transit = compute_transit_proximity(grid)
+    roads = compute_road_density(grid)
 
-    transit = compute_transit_proximity(sample)
-    print(f"Transit proximity:\n{transit}")
+    osmnx_df = walk.merge(transit, on="h3_index").merge(roads, on="h3_index")
 
-    roads = compute_road_density(sample)
-    print(f"Road density:\n{roads}")
+    out = Path("data/osmnx_features_hex.parquet")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    osmnx_df.to_parquet(out, index=False)
+    print(f"Saved to {out}: {len(osmnx_df)} rows, columns={list(osmnx_df.columns)}")

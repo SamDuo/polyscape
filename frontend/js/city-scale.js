@@ -1,328 +1,262 @@
 /**
  * PolyScape — City Scale Layer (zoom < 12)
  *
- * Renders H3 hex density overlays via Deck.gl and difference contour
- * lines via D3 contours projected back to geographic coordinates.
+ * VISIBLE AT THIS BAND:
+ *   - H3 hex density fills (Deck.gl H3HexagonLayer, color by suitability score)
+ *   - Contour lines (d3-contour → Mapbox GeoJSON line layer, A-B diff)
+ *   - 3D mode: extrude hexes by score
+ *
+ * HIDDEN AT THIS BAND:
+ *   - SHAP lens markers (district)
+ *   - Profile cards (street)
  */
 
 class CityScaleLayer {
   constructor() {
     this.map = null;
     this.overlay = null;
-    this.visible = false;
-    this.hexDataA = [];
-    this.hexDataB = [];
+    this.visible = false;      // is this band currently active?
+    this._hexEnabled = true;   // layer toggle from Layers dropdown
+    this._contourEnabled = true;
+    this._is3D = false;
+    this._loading = false;
+    this.hexDataA = [];        // base scenario
+    this.hexDataB = [];        // what-if scenario
     this._contourSourceId = 'contour-source';
     this._contourLineId = 'contour-line';
     this._contourGlowId = 'contour-glow';
   }
 
-  /**
-   * Initialize Deck.gl overlay on the Mapbox map.
-   */
   init(mapInstance) {
     this.map = mapInstance;
-
-    this.overlay = new deck.MapboxOverlay({
-      interleaved: true,
-      layers: [],
-    });
+    this.overlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
     this.map.addControl(this.overlay);
+    this._addMapboxLayers();
+  }
 
-    // Empty GeoJSON source for contour lines
+  /** Add Mapbox source + layers for contour lines. */
+  _addMapboxLayers() {
+    if (this.map.getSource(this._contourSourceId)) return; // already exists
     this.map.addSource(this._contourSourceId, {
       type: 'geojson',
       data: { type: 'FeatureCollection', features: [] },
     });
-
-    // Glow underlay
     this.map.addLayer({
-      id: this._contourGlowId,
-      type: 'line',
-      source: this._contourSourceId,
+      id: this._contourGlowId, type: 'line', source: this._contourSourceId,
       paint: {
-        'line-color': [
-          'interpolate', ['linear'], ['get', 'threshold'],
-          -0.3, '#ef5350',
-          -0.15, '#ef5350',
-          0, '#888888',
-          0.15, '#66bb6a',
-          0.3, '#66bb6a',
-        ],
-        'line-width': 6,
-        'line-opacity': 0,
+        'line-color': ['interpolate', ['linear'], ['get', 'threshold'],
+          -0.3, '#ef5350', 0, '#888', 0.3, '#66bb6a'],
+        'line-width': 5, 'line-opacity': 0, 'line-blur': 3,
       },
     });
-
-    // Main contour line
     this.map.addLayer({
-      id: this._contourLineId,
-      type: 'line',
-      source: this._contourSourceId,
+      id: this._contourLineId, type: 'line', source: this._contourSourceId,
       paint: {
-        'line-color': [
-          'interpolate', ['linear'], ['get', 'threshold'],
-          -0.3, '#ef5350',
-          -0.15, '#ef5350',
-          0, '#888888',
-          0.15, '#66bb6a',
-          0.3, '#66bb6a',
-        ],
-        'line-width': 2,
-        'line-opacity': 0,
+        'line-color': ['interpolate', ['linear'], ['get', 'threshold'],
+          -0.3, '#ef5350', 0, '#888', 0.3, '#66bb6a'],
+        'line-width': 2, 'line-opacity': 0,
       },
     });
   }
 
-  /**
-   * Fetch hex prediction data from backend.
-   */
+  /** Re-add Mapbox layers after a style change (e.g. satellite toggle). */
+  readdMapboxLayers() {
+    this._addMapboxLayers();
+    if (this.visible) this._applyContourVisibility();
+  }
+
+  // ── Layer toggles (from Layers dropdown checkboxes) ──────
+  setHexVisible(enabled) {
+    this._hexEnabled = enabled;
+    if (this.visible) this._renderHexLayers();
+    else if (!enabled && this.overlay) this.overlay.setProps({ layers: [] });
+  }
+
+  setContoursVisible(enabled) {
+    this._contourEnabled = enabled;
+    this._applyContourVisibility();
+  }
+
+  set3D(enabled) {
+    this._is3D = enabled;
+    if (this.visible && this.hexDataA.length) this._renderHexLayers();
+  }
+
+  // ── Data loading ─────────────────────────────────────────
   async loadHexData(bbox) {
+    if (this._loading) return;
+    this._loading = true;
     try {
-      const qs = `bbox=${bbox.join(',')}&res=8`;
-      const resp = await fetch(`/predict?${qs}`);
+      const resp = await fetch(`/predict?bbox=${bbox.join(',')}&res=8`);
       if (!resp.ok) return;
       const geojson = await resp.json();
-
-      // Split features by scenario property
-      this.hexDataA = geojson.features
-        .filter((f) => f.properties.scenario === 'A' || !f.properties.scenario)
-        .map((f) => ({
-          hex: f.properties.h3_index || f.properties.hex,
-          value: f.properties.score ?? f.properties.value ?? 0,
-        }));
-
-      this.hexDataB = geojson.features
-        .filter((f) => f.properties.scenario === 'B')
-        .map((f) => ({
-          hex: f.properties.h3_index || f.properties.hex,
-          value: f.properties.score ?? f.properties.value ?? 0,
-        }));
-
-      if (this.visible) {
-        this.renderScenarioLayers(this.hexDataA, this.hexDataB);
-        const contours = this.computeContours(this.hexDataA, this.hexDataB);
-        this.renderContours(contours);
-      }
-    } catch (err) {
-      console.warn('CityScaleLayer: loadHexData failed', err);
-    }
+      this.hexDataA = geojson.features.map(f => ({
+        hex: f.properties.h3_index,
+        value: f.properties.score ?? 0,
+      }));
+      if (!this.hexDataB.length) this.hexDataB = this.hexDataA.map(d => ({ ...d }));
+      if (this.visible) this._render();
+      this._updateBrief();
+    } catch (err) { console.warn('CityScale: loadHexData failed', err); }
+    finally { this._loading = false; }
   }
 
-  /**
-   * Render two H3HexagonLayer instances for scenario comparison.
-   */
-  renderScenarioLayers(dataA, dataB) {
+  /** Called by ScenarioManager when what-if is applied. */
+  setScenarioB(data) {
+    this.hexDataB = data;
+    if (this.visible) this._render();
+    const el = document.getElementById('brief-scenario');
+    if (el) el.textContent = 'What-If Active';
+  }
+
+  // ── Rendering ────────────────────────────────────────────
+  _render() {
+    this._renderHexLayers();
+    this._renderContours();
+  }
+
+  _renderHexLayers() {
     if (!this.overlay) return;
 
-    const maxVal = Math.max(
-      ...dataA.map((d) => Math.abs(d.value)),
-      ...dataB.map((d) => Math.abs(d.value)),
-      1
-    );
+    // If hex layer is disabled or band is hidden, clear Deck.gl
+    if (!this.visible || !this._hexEnabled || !this.hexDataA.length) {
+      this.overlay.setProps({ layers: [] });
+      return;
+    }
 
-    const layerA = new deck.H3HexagonLayer({
-      id: 'hex-scenario-a',
-      data: dataA,
-      getHexagon: (d) => d.hex,
-      getFillColor: (d) => {
+    const maxVal = Math.max(...this.hexDataA.map(d => d.value), 0.01);
+    const layers = [new deck.H3HexagonLayer({
+      id: 'hex-a',
+      data: this.hexDataA,
+      getHexagon: d => d.hex,
+      getFillColor: d => {
         const t = Math.min(d.value / maxVal, 1);
-        return [66, 133, 244, Math.round(t * 100)]; // blue ramp, 40% max
+        // Teal ramp: low scores dim, high scores bright
+        return [0, Math.round(100 + t * 91), Math.round(100 + t * 65), Math.round(40 + t * 170)];
       },
-      getElevation: 0,
-      extruded: false,
-      opacity: this.visible ? 0.4 : 0,
+      extruded: this._is3D,
+      getElevation: d => this._is3D ? d.value * 5000 : 0,
+      elevationScale: 1,
+      opacity: 0.7,
       pickable: true,
-    });
+      autoHighlight: true,
+      highlightColor: [0, 191, 165, 100],
+      onHover: info => this._onHover(info),
+    })];
 
-    const layerB = new deck.H3HexagonLayer({
-      id: 'hex-scenario-b',
-      data: dataB,
-      getHexagon: (d) => d.hex,
-      getFillColor: (d) => {
-        const t = Math.min(d.value / maxVal, 1);
-        return [255, 152, 0, Math.round(t * 100)]; // orange ramp, 40% max
-      },
-      getElevation: 0,
-      extruded: false,
-      opacity: this.visible ? 0.4 : 0,
-      pickable: true,
-    });
-
-    this.overlay.setProps({ layers: [layerA, layerB] });
-  }
-
-  /**
-   * Compute per-hex score difference → rasterize → d3.contours().
-   */
-  computeContours(dataA, dataB) {
-    if (!dataA.length && !dataB.length) {
-      return { type: 'FeatureCollection', features: [] };
-    }
-
-    // Build lookup of hex → value for each scenario
-    const mapA = new Map(dataA.map((d) => [d.hex, d.value]));
-    const mapB = new Map(dataB.map((d) => [d.hex, d.value]));
-    const allHexes = new Set([...mapA.keys(), ...mapB.keys()]);
-
-    // Compute differences and collect centroids
-    const hexPoints = [];
-    for (const hex of allHexes) {
-      const valA = mapA.get(hex) ?? 0;
-      const valB = mapB.get(hex) ?? 0;
-      try {
-        const [lat, lng] = h3.cellToLatLng(hex);
-        hexPoints.push({ lng, lat, diff: valB - valA });
-      } catch {
-        // skip invalid hex
-      }
-    }
-
-    if (hexPoints.length < 3) {
-      return { type: 'FeatureCollection', features: [] };
-    }
-
-    // Bounding box of hex centroids
-    const lngs = hexPoints.map((p) => p.lng);
-    const lats = hexPoints.map((p) => p.lat);
-    const bbox = [
-      Math.min(...lngs) - 0.01,
-      Math.min(...lats) - 0.01,
-      Math.max(...lngs) + 0.01,
-      Math.max(...lats) + 0.01,
-    ];
-
-    // IDW interpolation to grid
-    const gridW = 200;
-    const gridH = 200;
-    const grid = idwInterpolation(hexPoints, gridW, gridH, bbox, 2);
-
-    // Generate contours
-    const contourGen = d3.contours().size([gridW, gridH]).thresholds([-0.3, -0.15, 0.15, 0.3]);
-    const rawContours = contourGen(grid);
-
-    // Transform grid coords back to geographic
-    const dLng = (bbox[2] - bbox[0]) / gridW;
-    const dLat = (bbox[3] - bbox[1]) / gridH;
-
-    const features = rawContours.map((contour) => {
-      const geoCoords = contour.coordinates.map((ring) =>
-        ring.map((polygon) =>
-          polygon.map(([gx, gy]) => [bbox[0] + gx * dLng, bbox[1] + gy * dLat])
-        )
-      );
-      return {
-        type: 'Feature',
-        properties: { threshold: contour.value },
-        geometry: {
-          type: contour.type,
-          coordinates: geoCoords,
+    // Scenario B overlay (orange) — only if different from A
+    const hasDiff = this.hexDataB.some((b, i) =>
+      this.hexDataA[i] && Math.abs(b.value - this.hexDataA[i].value) > 0.001);
+    if (hasDiff) {
+      const maxB = Math.max(...this.hexDataB.map(d => d.value), 0.01);
+      layers.push(new deck.H3HexagonLayer({
+        id: 'hex-b', data: this.hexDataB,
+        getHexagon: d => d.hex,
+        getFillColor: d => {
+          const t = Math.min(d.value / maxB, 1);
+          return [255, 152, 0, Math.round(t * 120)];
         },
-      };
-    });
+        extruded: this._is3D,
+        getElevation: d => this._is3D ? d.value * 5000 : 0,
+        opacity: 0.35, pickable: false,
+      }));
+    }
 
-    return { type: 'FeatureCollection', features };
+    this.overlay.setProps({ layers });
   }
 
-  /**
-   * Add/update contour lines on the Mapbox source.
-   */
-  renderContours(contourGeoJSON) {
+  _renderContours() {
+    const contours = this._computeContours();
     const src = this.map.getSource(this._contourSourceId);
-    if (src) {
-      src.setData(contourGeoJSON);
+    if (src) src.setData(contours);
+    this._applyContourVisibility();
+  }
+
+  _applyContourVisibility() {
+    const show = this.visible && this._contourEnabled;
+    try {
+      this.map.setPaintProperty(this._contourLineId, 'line-opacity', show ? 0.9 : 0);
+      this.map.setPaintProperty(this._contourGlowId, 'line-opacity', show ? 0.2 : 0);
+    } catch { /* layers may not exist yet */ }
+  }
+
+  _onHover(info) {
+    const el = document.getElementById('brief-top');
+    if (el && info.object) {
+      el.textContent = info.object.hex.slice(4, 12) + ' = ' + info.object.value.toFixed(3);
     }
   }
 
-  /**
-   * Show city-scale layers with smooth fade.
-   */
+  // ── Contour computation ──────────────────────────────────
+  _computeContours() {
+    if (!this.hexDataA.length) return { type: 'FeatureCollection', features: [] };
+    const mapA = new Map(this.hexDataA.map(d => [d.hex, d.value]));
+    const mapB = new Map(this.hexDataB.map(d => [d.hex, d.value]));
+    const pts = [];
+    for (const [hex, vA] of mapA) {
+      const vB = mapB.get(hex) ?? vA;
+      try { const [lat, lng] = h3.cellToLatLng(hex); pts.push({ lng, lat, diff: vB - vA }); } catch {}
+    }
+    const maxDiff = pts.length >= 3 ? Math.max(...pts.map(p => Math.abs(p.diff))) : 0;
+    if (maxDiff < 0.001) return { type: 'FeatureCollection', features: [] };
+
+    const lngs = pts.map(p => p.lng), lats = pts.map(p => p.lat);
+    const bb = [Math.min(...lngs) - .01, Math.min(...lats) - .01, Math.max(...lngs) + .01, Math.max(...lats) + .01];
+    const W = 200, H = 200, grid = idwInterpolation(pts, W, H, bb, 2);
+    const raw = d3.contours().size([W, H]).thresholds([-.3, -.15, .15, .3])(grid);
+    const dLng = (bb[2] - bb[0]) / W, dLat = (bb[3] - bb[1]) / H;
+    return {
+      type: 'FeatureCollection',
+      features: raw.map(c => ({
+        type: 'Feature',
+        properties: { threshold: c.value },
+        geometry: { type: c.type, coordinates: c.coordinates.map(r => r.map(p => p.map(([gx, gy]) => [bb[0] + gx * dLng, bb[1] + gy * dLat]))) },
+      })),
+    };
+  }
+
+  _updateBrief() {
+    if (!this.hexDataA.length) return;
+    const best = this.hexDataA.reduce((a, b) => a.value > b.value ? a : b);
+    const el = document.getElementById('brief-top');
+    if (el) el.textContent = best.hex.slice(4, 12) + ' = ' + best.value.toFixed(3);
+    const scEl = document.getElementById('brief-scenario');
+    if (scEl && !this.hexDataB.some((b, i) => this.hexDataA[i] && Math.abs(b.value - this.hexDataA[i].value) > 0.001))
+      scEl.textContent = 'Base (' + this.hexDataA.length + ' hexes)';
+  }
+
+  // ── Show / Hide (called by SemanticZoomController) ───────
   show() {
     this.visible = true;
-
-    // Fade in Deck.gl hex layers
-    if (this.hexDataA.length || this.hexDataB.length) {
-      this.renderScenarioLayers(this.hexDataA, this.hexDataB);
-    }
-
-    // Fade in contour lines
-    this.map.setPaintProperty(this._contourLineId, 'line-opacity', 0.9);
-    this.map.setPaintProperty(this._contourGlowId, 'line-opacity', 0.2);
-
-    this._updateHexCount();
+    if (this.hexDataA.length) this._render();
+    else this._applyContourVisibility(); // show contours even before hex data loads
   }
 
-  /**
-   * Hide city-scale layers with smooth fade.
-   */
   hide() {
     this.visible = false;
-
-    if (this.overlay) {
-      this.overlay.setProps({ layers: [] });
-    }
-
-    this.map.setPaintProperty(this._contourLineId, 'line-opacity', 0);
-    this.map.setPaintProperty(this._contourGlowId, 'line-opacity', 0);
-  }
-
-  /** Update hex count in stats bar. */
-  _updateHexCount() {
-    const el = document.getElementById('stat-hexes');
-    if (el) {
-      const count = new Set([
-        ...this.hexDataA.map((d) => d.hex),
-        ...this.hexDataB.map((d) => d.hex),
-      ]).size;
-      el.textContent = count.toLocaleString();
-    }
+    // Clear Deck.gl hex layers
+    if (this.overlay) this.overlay.setProps({ layers: [] });
+    // Hide contour Mapbox layers
+    this._applyContourVisibility();
   }
 }
 
-// ── IDW Interpolation Helper ────────────────────────────────
-
-/**
- * Inverse Distance Weighting interpolation.
- * @param {Array<{lng, lat, diff}>} hexPoints - known data points
- * @param {number} gridWidth  - output grid columns
- * @param {number} gridHeight - output grid rows
- * @param {number[]} bbox     - [west, south, east, north]
- * @param {number} power      - distance weighting power
- * @returns {Float64Array}     flat row-major grid of interpolated values
- */
-function idwInterpolation(hexPoints, gridWidth, gridHeight, bbox, power = 2) {
-  const grid = new Float64Array(gridWidth * gridHeight);
-  const dLng = (bbox[2] - bbox[0]) / gridWidth;
-  const dLat = (bbox[3] - bbox[1]) / gridHeight;
-
-  for (let row = 0; row < gridHeight; row++) {
-    const lat = bbox[1] + (row + 0.5) * dLat;
-    for (let col = 0; col < gridWidth; col++) {
-      const lng = bbox[0] + (col + 0.5) * dLng;
-
-      let numerator = 0;
-      let denominator = 0;
-      let exact = null;
-
-      for (const pt of hexPoints) {
-        const dx = lng - pt.lng;
-        const dy = lat - pt.lat;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-
-        if (dist < 1e-10) {
-          exact = pt.diff;
-          break;
-        }
-
-        const w = 1 / Math.pow(dist, power);
-        numerator += w * pt.diff;
-        denominator += w;
+// ── IDW Interpolation ──────────────────────────────────────
+function idwInterpolation(pts, W, H, bb, pow) {
+  const grid = new Float64Array(W * H);
+  const dLng = (bb[2] - bb[0]) / W, dLat = (bb[3] - bb[1]) / H;
+  for (let r = 0; r < H; r++) {
+    const lat = bb[1] + (r + .5) * dLat;
+    for (let c = 0; c < W; c++) {
+      const lng = bb[0] + (c + .5) * dLng;
+      let num = 0, den = 0, exact = null;
+      for (const p of pts) {
+        const d = Math.sqrt((lng - p.lng) ** 2 + (lat - p.lat) ** 2);
+        if (d < 1e-10) { exact = p.diff; break; }
+        const w = 1 / d ** pow; num += w * p.diff; den += w;
       }
-
-      grid[row * gridWidth + col] =
-        exact !== null ? exact : denominator > 0 ? numerator / denominator : 0;
+      grid[r * W + c] = exact !== null ? exact : den > 0 ? num / den : 0;
     }
   }
-
   return grid;
 }

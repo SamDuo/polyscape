@@ -6,6 +6,7 @@ dictionary fallback when Redis is unavailable.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Optional
@@ -153,12 +154,14 @@ class SHAPCache:
                 key = f"{REDIS_KEY_PREFIX}{h3_index}"
                 raw = self._redis_client.get(key)  # type: ignore[union-attr]
                 if raw is not None:
-                    return json.loads(raw)
+                    return json.loads(raw)  # already a fresh dict from deserialization
             except Exception:
                 pass
             # Fall through to memory cache
-            return self._memory_cache.get(h3_index)
-        return self._memory_cache.get(h3_index)
+            entry = self._memory_cache.get(h3_index)
+            return copy.copy(entry) if entry is not None else None
+        entry = self._memory_cache.get(h3_index)
+        return copy.copy(entry) if entry is not None else None
 
     def get_batch(self, h3_indices: list[str]) -> dict[str, dict]:
         """Retrieve SHAP values for multiple hexes.

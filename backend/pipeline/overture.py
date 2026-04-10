@@ -72,6 +72,8 @@ def fetch_pois(
         raise ImportError(
             "overturemaps is required. Install with: pip install overturemaps"
         )
+    from shapely import wkb
+    from shapely.geometry import shape
 
     bbox = bbox or ATLANTA_BBOX
 
@@ -100,9 +102,21 @@ def fetch_pois(
             else:
                 record["category"] = ""
 
-            # Extract geometry
-            geom = tbl.get("geometry", [None] * n_rows)
-            record["geometry"] = geom[i] if i < len(geom) else None
+            # Extract and convert geometry from WKB bytes to Shapely
+            geom_raw = tbl.get("geometry", [None] * n_rows)
+            raw = geom_raw[i] if i < len(geom_raw) else None
+            if raw is not None:
+                try:
+                    if isinstance(raw, bytes):
+                        record["geometry"] = wkb.loads(raw)
+                    elif isinstance(raw, dict):
+                        record["geometry"] = shape(raw)
+                    else:
+                        record["geometry"] = None
+                except Exception:
+                    record["geometry"] = None
+            else:
+                record["geometry"] = None
 
             records.append(record)
 
@@ -110,10 +124,21 @@ def fetch_pois(
         print("Warning: no POIs fetched from Overture Maps.")
         return gpd.GeoDataFrame(
             columns=["id", "name", "category", "geometry"],
+            geometry="geometry",
             crs="EPSG:4326",
         )
 
-    gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+    # Filter out records with no valid geometry
+    records = [r for r in records if r.get("geometry") is not None]
+    if not records:
+        print("Warning: all POI geometries failed to parse.")
+        return gpd.GeoDataFrame(
+            columns=["id", "name", "category", "geometry"],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+
+    gdf = gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
     print(f"Fetched {len(gdf)} POIs from Overture Maps")
     return gdf
 

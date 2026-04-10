@@ -41,12 +41,14 @@ def compute_shap_values(
         Columns: h3_index, one SHAP value column per feature, base_value.
     """
     X = _prepare_features(features_df)
+    # Ensure column order matches FEATURE_COLUMNS (which matches training order)
+    X = X[FEATURE_COLUMNS]
 
     print(f"Computing SHAP values for {len(X)} hexes...")
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
-    # Build result DataFrame
+    # Build result DataFrame — column order is guaranteed by X[FEATURE_COLUMNS] above
     shap_cols = {f"shap_{col}": shap_values[:, i] for i, col in enumerate(FEATURE_COLUMNS)}
     result = pd.DataFrame(shap_cols)
 

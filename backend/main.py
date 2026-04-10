@@ -1,10 +1,14 @@
 """FastAPI application for PolyScape GeoAI site-selection API.
 
 Endpoints:
-  GET  /              — health check
+  GET  /              — serves frontend index.html
+  GET  /api/health    — health check
+  GET  /api/config    — Mapbox token + feature list
   GET  /predict       — H3 hex grid with suitability scores as GeoJSON
   GET  /explain/{h3}  — per-feature SHAP explanation for a hex
-  GET  /scenarios/diff — score difference between base and modified scenario
+  POST /explain/batch — batch SHAP explanations for multiple hexes
+  GET  /features/{h3} — raw feature values for a hex
+  POST /scenarios/diff — score difference between base and modified scenario
   POST /predict/custom — predictions with custom feature overrides
 """
 
@@ -19,8 +23,9 @@ import h3
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from shapely.geometry import mapping as shapely_mapping
@@ -36,6 +41,7 @@ MODEL_PATH = Path(os.getenv("POLYSCAPE_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 SHAP_CACHE_PATH = Path(os.getenv("POLYSCAPE_SHAP_CACHE", "data/models/shap_cache.parquet"))
 REDIS_URL = os.getenv("POLYSCAPE_REDIS_URL", None)
 FRONTEND_DIR = Path(os.getenv("POLYSCAPE_FRONTEND_DIR", "frontend"))
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 
 # ---------- Global state ----------
 
@@ -100,11 +106,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Mount static frontend files
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
 
 # ---------- Request / Response models ----------
 
@@ -185,9 +186,23 @@ def _filter_by_bbox(
     return df
 
 
+class BatchExplainRequest(BaseModel):
+    """Request body for POST /explain/batch."""
+    h3_indices: list[str]
+
+
 # ---------- Endpoints ----------
 
 @app.get("/")
+async def serve_frontend():
+    """Serve the frontend index.html."""
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return {"status": "ok", "message": "Frontend not found. API is running."}
+
+
+@app.get("/api/health")
 async def health_check() -> dict:
     """Health check endpoint."""
     return {
@@ -198,12 +213,22 @@ async def health_check() -> dict:
     }
 
 
+@app.get("/api/config")
+async def get_config() -> dict:
+    """Return frontend configuration including Mapbox token."""
+    return {
+        "mapboxToken": MAPBOX_TOKEN,
+        "features": FEATURE_COLUMNS,
+        "hexCount": len(_features_df) if _features_df is not None else 0,
+    }
+
+
 @app.get("/predict")
 async def predict_endpoint(
     bbox: str = Query(
         ...,
         description="Bounding box as 'west,south,east,north'",
-        example="-84.5,33.6,-84.2,33.9",
+        examples=["-84.5,33.6,-84.2,33.9"],
     ),
     res: int = Query(
         8,
@@ -258,7 +283,7 @@ async def explain_endpoint(h3_index: str) -> ExplainResponse:
             detail=f"No SHAP data found for hex {h3_index}.",
         )
 
-    base_value = entry.pop("base_value", 0.0)
+    base_value = entry.get("base_value", 0.0)
     shap_values = [
         SHAPFeature(feature=feat, value=round(val, 6))
         for feat, val in entry.items()
@@ -283,17 +308,90 @@ async def explain_endpoint(h3_index: str) -> ExplainResponse:
     )
 
 
-@app.get("/scenarios/diff")
-async def scenarios_diff(
-    bbox: str = Query(
-        ...,
-        description="Bounding box as 'west,south,east,north'",
-    ),
-    **kwargs: float,
-) -> dict:
+@app.post("/explain/batch")
+async def explain_batch(request: BatchExplainRequest) -> dict:
+    """Return SHAP explanations for multiple hexes with centroid coordinates."""
+    if _shap_cache is None:
+        raise HTTPException(status_code=503, detail="SHAP cache not loaded.")
+
+    explanations = []
+    for h3_idx in request.h3_indices[:100]:  # cap at 100
+        entry = _shap_cache.get(h3_idx)
+        if entry is None:
+            continue
+
+        base_value = entry.get("base_value", 0.0)
+        shap_values = [
+            {"feature": feat, "value": round(val, 6)}
+            for feat, val in entry.items()
+            if feat in FEATURE_COLUMNS
+        ]
+        shap_values.sort(key=lambda x: abs(x["value"]), reverse=True)
+
+        # Get centroid
+        try:
+            lat, lng = h3.cell_to_latlng(h3_idx)
+        except Exception:
+            continue
+
+        # Get score
+        score = None
+        if _model is not None and _features_df is not None:
+            row = _features_df[_features_df["h3_index"] == h3_idx]
+            if not row.empty:
+                s = predict(_model, row)
+                score = round(float(s[0]), 4)
+
+        explanations.append({
+            "h3_index": h3_idx,
+            "score": score,
+            "base_value": round(base_value, 6),
+            "shap_values": shap_values,
+            "centroid": {"lat": lat, "lng": lng},
+        })
+
+    return {"explanations": explanations}
+
+
+@app.get("/features/{h3_index}")
+async def get_features(h3_index: str) -> dict:
+    """Return raw feature values for a hex (used by profile cards)."""
+    if _features_df is None or _features_df.empty:
+        raise HTTPException(status_code=503, detail="Feature data not loaded.")
+
+    row = _features_df[_features_df["h3_index"] == h3_index]
+    if row.empty:
+        raise HTTPException(status_code=404, detail=f"Hex {h3_index} not found.")
+
+    row = row.iloc[0]
+    features = {}
+    for col in _features_df.columns:
+        if col in ("geometry",):
+            continue
+        val = row[col]
+        if pd.isna(val):
+            features[col] = None
+        elif isinstance(val, (np.integer,)):
+            features[col] = int(val)
+        elif isinstance(val, (np.floating, float)):
+            features[col] = round(float(val), 4)
+        else:
+            features[col] = val
+
+    return features
+
+
+class ScenarioDiffRequest(BaseModel):
+    """Request body for POST /scenarios/diff."""
+    bbox: str = Field(..., description="Bounding box as 'west,south,east,north'")
+    overrides: list[FeatureOverride] = Field(default_factory=list)
+
+
+@app.post("/scenarios/diff")
+async def scenarios_diff(request: ScenarioDiffRequest) -> dict:
     """Compute score difference between base and modified scenario.
 
-    Pass feature overrides as query params (e.g., &median_income=75000).
+    Send feature overrides in the request body.
     """
     if _model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
@@ -302,7 +400,7 @@ async def scenarios_diff(
 
     # Parse bbox
     try:
-        parts = [float(x.strip()) for x in bbox.split(",")]
+        parts = [float(x.strip()) for x in request.bbox.split(",")]
         w, s, e, n = parts
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid bbox format.")
@@ -316,9 +414,9 @@ async def scenarios_diff(
 
     # Modified scores with overrides
     modified = filtered.copy()
-    for feat in FEATURE_COLUMNS:
-        if feat in kwargs:
-            modified[feat] = kwargs[feat]
+    for override in request.overrides:
+        if override.feature in FEATURE_COLUMNS:
+            modified[override.feature] = override.value
     modified_scores = predict(_model, modified)
 
     diff_scores = modified_scores - base_scores
@@ -374,12 +472,17 @@ async def predict_custom(request: CustomPredictRequest) -> dict:
     )
 
 
+# ---------- Static files (must be AFTER all API routes) ----------
+
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
 # ---------- Main ----------
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("POLYSCAPE_PORT", "8000"))
+    port = int(os.getenv("POLYSCAPE_PORT", "8080"))
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
