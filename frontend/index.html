@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PolyScape — Multi-Scale GeoAI Visualization</title>
+
+  <!-- Mapbox GL JS v3.9.0 -->
+  <link rel="stylesheet" href="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.css">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.js"></script>
+
+  <!-- Deck.gl v9.1.0 (core + aggregation layers + mapbox integration) -->
+  <script src="https://unpkg.com/@deck.gl/core@9.1.0/dist.min.js"></script>
+  <script src="https://unpkg.com/@deck.gl/layers@9.1.0/dist.min.js"></script>
+  <script src="https://unpkg.com/@deck.gl/aggregation-layers@9.1.0/dist.min.js"></script>
+  <script src="https://unpkg.com/@deck.gl/geo-layers@9.1.0/dist.min.js"></script>
+  <script src="https://unpkg.com/@deck.gl/mapbox@9.1.0/dist.min.js"></script>
+
+  <!-- D3.js v7.9.0 + d3-contour v4.0.2 -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-contour@4.0.2/dist/d3-contour.min.js"></script>
+
+  <!-- H3-js v4.2.0 (client-side hex operations) -->
+  <script src="https://unpkg.com/h3-js@4.2.0/dist/h3-js.umd.js"></script>
+
+  <!-- PolyScape styles -->
+  <link rel="stylesheet" href="css/polyscape.css">
+</head>
+<body>
+
+  <!-- Full-viewport map container -->
+  <div id="map"></div>
+
+  <!-- Left sidebar: scenario controls -->
+  <div id="scenario-panel" class="scenario-panel"></div>
+
+  <!-- Bottom stats bar -->
+  <div id="stats-bar" class="stats-bar">
+    <div class="stat-item">
+      <span class="stat-label">Band:</span>
+      <span class="stat-value" id="stat-band">--</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Zoom:</span>
+      <span class="stat-value" id="stat-zoom">--</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Hexes:</span>
+      <span class="stat-value" id="stat-hexes">0</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Visible:</span>
+      <span class="stat-value" id="stat-visible">0</span>
+    </div>
+  </div>
+
+  <!-- Scale indicator badge (top-right) -->
+  <div id="scale-indicator" class="scale-indicator">City</div>
+
+  <!-- PolyScape JS modules (order matters: dependencies first) -->
+  <script src="js/city-scale.js"></script>
+  <script src="js/district-scale.js"></script>
+  <script src="js/street-scale.js"></script>
+  <script src="js/scenarios.js"></script>
+  <script src="js/app.js"></script>
+
+</body>
+</html>
