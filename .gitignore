@@ -12,3 +12,6 @@ dist/
 build/
 .DS_Store
 Thumbs.db
+
+# Raw county tax-parcel extracts (60-90 MB each; re-download from Fulton County)
+data/labels/tax_parcels_*.csv

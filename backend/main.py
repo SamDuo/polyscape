@@ -33,6 +33,7 @@ from shapely.geometry import Polygon
 
 from backend.cache import SHAPCache
 from backend.model import DEFAULT_MODEL_PATH, FEATURE_COLUMNS, _prepare_features, load_model, predict
+from backend.v2 import V2Predictor
 
 # ---------- Configuration ----------
 
@@ -48,6 +49,7 @@ MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN", "")
 _model: Optional[xgb.XGBRegressor] = None
 _shap_cache: Optional[SHAPCache] = None
 _features_df: Optional[pd.DataFrame] = None
+_v2 = V2Predictor()
 
 
 # ---------- Startup / Shutdown ----------
@@ -83,6 +85,12 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"Warning: failed to load features: {exc}")
 
+    # Load v2 (composite-target) predictor
+    try:
+        _v2.load()
+    except Exception as exc:
+        print(f"Warning: failed to load v2 predictor: {exc}")
+
     yield
 
     # Cleanup
@@ -105,7 +113,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Model-Version"],
 )
+
+
+@app.middleware("http")
+async def add_model_version_header(request: Request, call_next):
+    """Stamp every response with the loaded v2 model version so clients
+    can detect drift when the artifact is redeployed."""
+    response = await call_next(request)
+    if _v2.ready:
+        response.headers["X-Model-Version"] = _v2.card.get("version", "unknown")
+    return response
 
 # ---------- Request / Response models ----------
 
@@ -204,13 +223,49 @@ async def serve_frontend():
 
 @app.get("/api/health")
 async def health_check() -> dict:
-    """Health check endpoint."""
+    """Health check endpoint. Reports both legacy (v1) and production (v2) state."""
     return {
         "status": "ok",
-        "model_loaded": _model is not None,
-        "shap_cache_size": _shap_cache.size if _shap_cache else 0,
-        "features_loaded": _features_df is not None and len(_features_df) > 0,
+        "v1": {
+            "model_loaded": _model is not None,
+            "shap_cache_size": _shap_cache.size if _shap_cache else 0,
+            "features_loaded": _features_df is not None and len(_features_df) > 0,
+        },
+        "v2": _v2.model_info(),
     }
+
+
+@app.get("/v2/coverage/{h3_index}")
+async def v2_coverage(h3_index: str) -> dict:
+    """Return whether the v2 model has data for this hex.
+
+    Clients should call this before /v2/explain to distinguish 'out of
+    coverage' from 'service error'.
+    """
+    if not _v2.ready:
+        raise HTTPException(status_code=503, detail="v2 predictor not loaded")
+    if not _v2.is_in_coverage(h3_index):
+        raise HTTPException(status_code=404, detail="hex out of model coverage")
+    return {"h3_index": h3_index, "in_coverage": True}
+
+
+@app.get("/v2/explain/{h3_index}")
+async def v2_explain(h3_index: str) -> dict:
+    """v2 SHAP explanation for a hex, served from the precomputed cache."""
+    if not _v2.ready:
+        raise HTTPException(status_code=503, detail="v2 predictor not loaded")
+    result = _v2.explain(h3_index)
+    if result is None:
+        raise HTTPException(status_code=404, detail="hex out of model coverage")
+    return result
+
+
+@app.get("/v2/info")
+async def v2_info() -> dict:
+    """Model card for the loaded v2 model (version, target, metrics, label sources)."""
+    if not _v2.ready:
+        raise HTTPException(status_code=503, detail="v2 predictor not loaded")
+    return _v2.model_info()
 
 
 @app.get("/api/config")
